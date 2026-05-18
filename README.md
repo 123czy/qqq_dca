@@ -15,7 +15,7 @@
 
 - **前端**: 单 HTML 文件（vanilla JS + Chart.js），无构建步骤
 - **后端**: 一个 Vercel Serverless Function (`api/market.js`)
-- **数据源**: [Stooq.com](https://stooq.com)（免费、无 API key、无限流）
+- **数据源**: Yahoo Finance v8 chart endpoint（免费、无 API key、覆盖股票/ETF/指数）
 - **缓存**: 服务端内存缓存 10 分钟 + 浏览器 localStorage
 
 ## 部署到 Vercel（首次部署）
@@ -60,7 +60,16 @@ git push -u origin main
   "ma200Pct": 16.65,
   "drawdown": 0.52,
   "latestDate": "2026-05-16",
-  "source": "stooq"
+  "source": "yahoo"
+}
+```
+
+再访问 `?ticker=VIX`：
+```json
+{
+  "ticker": "VIX",
+  "price": 17.85,
+  "source": "yahoo"
 }
 ```
 
@@ -78,21 +87,39 @@ vercel dev
 
 打开 `http://localhost:3000`。
 
+## 支持的 ticker
+
+代码里 `toYahooSymbol()` 函数处理 ticker 映射：
+
+| 输入 | Yahoo symbol | 用途 |
+|---|---|---|
+| `QQQ` | `QQQ` | Nasdaq 100 ETF |
+| `VIX` | `^VIX` | 恐慌指数 |
+| `SPX` | `^GSPC` | S&P 500 指数 |
+| `NDX` | `^NDX` | Nasdaq 100 指数 |
+| `DJI` | `^DJI` | 道琼斯指数 |
+| 其他 | 原样传 | 任意股票/ETF |
+
+要加新映射，修改 `api/market.js` 的 `toYahooSymbol()` 函数即可。
+
 ## 数据更新机制
 
-- **服务端缓存**：同一 ticker 10 分钟内复用，避免重复请求 Stooq
+- **服务端缓存**：同一 ticker 10 分钟内复用，避免重复请求 Yahoo
 - **浏览器 localStorage**：保存上次获取的数据，下次打开页面直接显示
-- **数据延迟**：Stooq 提供 EOD（end-of-day）数据，盘后约 1 小时更新
+- **数据延迟**：Yahoo 的 v8 chart endpoint 提供准实时数据（15分钟延迟）
 
 ## 数据源说明
 
-[Stooq.com](https://stooq.com) 是一个金融数据网站，提供全球股票、ETF、指数、外汇的免费历史数据。被无数开源项目（包括 pandas-datareader、quantmod 等）作为数据源。完全免费、不需要 API key、无明显限流。
+Yahoo Finance 的 v8 chart endpoint 是 yahoo.com 网站本身用来渲染历史走势图的接口，返回 JSON 格式的 OHLC 数据。虽然 Yahoo 关闭了官方 API 但这个 endpoint 一直工作。被 [yfinance](https://github.com/ranaroussi/yfinance)、[pandas-datareader](https://pandas-datareader.readthedocs.io/) 等知名库长期使用。
+
+**URL 格式**：`https://query1.finance.yahoo.com/v8/finance/chart/{SYMBOL}?range=1y&interval=1d`
 
 ## 故障排查
 
-- **API 返回 502**：检查 Stooq 是否能直接访问。打开 [https://stooq.com/q/d/l/?s=qqq.us&i=d](https://stooq.com/q/d/l/?s=qqq.us&i=d) 看是否能下载 CSV。
-- **"Stooq returned empty"**：Stooq 偶尔维护或临时限流。等几分钟重试。
-- **VIX 拉不到**：Stooq 的 VIX 是 `^VIX`（URL 编码为 `%5Evix`）。失败时可手动从 [Yahoo Finance VIX](https://finance.yahoo.com/quote/%5EVIX) 查并填入。
+- **API 返回 502 / "Yahoo HTTP 429"**：被限流了，等几分钟。我们已经设了 User-Agent 避免被直接拒，但如果几个朋友同时高频请求可能会触发。服务端 10 分钟缓存能避免这种情况。
+- **"Yahoo returned no result"**：ticker 拼错或 Yahoo 不认识。检查 [Yahoo Finance 网站](https://finance.yahoo.com) 上的 symbol 是否正确。
+- **VIX 显示为 null 或 0**：VIX 的 high 字段偶尔为 null（指数特性），代码会自动 fallback 到 close 值。
+- **数据是上个交易日的**：盘前盘后是正常的，Yahoo 在盘后才更新当日 EOD 数据。
 
 ## 免责声明
 

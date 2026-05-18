@@ -1,9 +1,9 @@
 /**
  * Vercel Serverless Function: /api/market
  *
- * 数据源 (全部免费、不要 key、不限流):
- *   - 股票/ETF (QQQ): Stooq.com CSV
- *   - VIX: Stooq.com (^VIX)
+ * 数据源: Yahoo Finance v8 chart endpoint (免费, 无 key, 无明确限流)
+ *   - QQQ:  https://query1.finance.yahoo.com/v8/finance/chart/QQQ?range=1y&interval=1d
+ *   - VIX:  https://query1.finance.yahoo.com/v8/finance/chart/^VIX?range=1y&interval=1d
  *
  * 计算:
  *   - 当前价
@@ -82,61 +82,75 @@ function aggregateToWeekly(dailyData) {
   return Array.from(weeks.values());
 }
 
-// ============ Stooq 数据源 ============
+// ============ Yahoo Finance 数据源 ============
+
 /**
- * Stooq 返回 CSV:
- *   Date,Open,High,Low,Close,Volume
- *   2024-01-02,408.55,410.34,406.50,409.52,38500000
+ * 构造 Yahoo v8 chart URL
+ * VIX 在 Yahoo 上是 ^VIX，URL 中需要编码为 %5EVIX
  */
-function buildStooqUrl(ticker) {
-  if (ticker === 'VIX') return 'https://stooq.com/q/d/l/?s=%5Evix&i=d'; // %5E = ^
-  return `https://stooq.com/q/d/l/?s=${ticker.toLowerCase()}.us&i=d`;
+function buildYahooUrl(ticker) {
+  const symbol = ticker === 'VIX' ? '%5EVIX' : encodeURIComponent(ticker);
+  return `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?range=1y&interval=1d`;
 }
 
-function parseStooqCSV(csvText) {
-  const lines = csvText.trim().split('\n');
-  if (lines.length < 2) {
-    throw new Error('Stooq CSV has no data rows');
+/**
+ * 调用 Yahoo Finance v8 chart endpoint
+ * 必须设置 User-Agent，否则 Yahoo 会拒绝默认 fetch 的 user-agent
+ */
+async function fetchFromYahoo(ticker) {
+  const url = buildYahooUrl(ticker);
+  const res = await fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Accept': 'application/json',
+      'Accept-Language': 'en-US,en;q=0.9',
+    },
+  });
+
+  if (!res.ok) {
+    throw new Error(`Yahoo HTTP ${res.status} for ${ticker}`);
   }
-  const header = lines[0].toLowerCase();
-  if (!header.includes('date') || !header.includes('close')) {
-    throw new Error(`Stooq CSV header invalid: "${lines[0].slice(0, 100)}"`);
+
+  const json = await res.json();
+
+  // Yahoo 的错误格式: { chart: { result: null, error: {...} } }
+  if (json.chart?.error) {
+    const e = json.chart.error;
+    throw new Error(`Yahoo API error: ${e.code || ''} ${e.description || JSON.stringify(e)}`);
   }
+
+  const result = json?.chart?.result?.[0];
+  if (!result) {
+    throw new Error(`Yahoo returned no result for ${ticker}`);
+  }
+
+  const timestamps = result.timestamp;
+  const quote = result.indicators?.quote?.[0];
+  if (!timestamps || !quote || !quote.close) {
+    throw new Error(`Yahoo response missing timestamps or close data for ${ticker}`);
+  }
+
+  // 转成统一格式 [{date, close, high}, ...] 时间升序
+  // Yahoo 返回本身就是升序，但有 null 值需过滤
   const values = [];
-  for (let i = 1; i < lines.length; i++) {
-    const parts = lines[i].split(',');
-    if (parts.length < 5) continue;
-    const close = parseFloat(parts[4]);
-    const high = parseFloat(parts[2]);
-    if (isNaN(close)) continue;
+  for (let i = 0; i < timestamps.length; i++) {
+    const close = quote.close[i];
+    const high = quote.high[i];
+    if (close == null) continue; // 跳过缺失数据点
+    const d = new Date(timestamps[i] * 1000);
+    const dateStr = d.toISOString().slice(0, 10);
     values.push({
-      date: parts[0],
-      high: isNaN(high) ? close : high,
-      close,
+      date: dateStr,
+      close: close,
+      high: high != null ? high : close,
     });
   }
-  if (values.length === 0) {
-    throw new Error('Stooq CSV parsed but no valid rows');
-  }
-  return values;
-}
 
-async function fetchFromStooq(ticker) {
-  const url = buildStooqUrl(ticker);
-  const res = await fetch(url, {
-    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; QQQDCABot/1.0)' },
-  });
-  if (!res.ok) {
-    throw new Error(`Stooq HTTP ${res.status} for ${ticker}`);
+  if (values.length === 0) {
+    throw new Error(`Yahoo returned data but no valid points for ${ticker}`);
   }
-  const text = await res.text();
-  if (!text || text.length < 50) {
-    throw new Error(`Stooq returned empty for ${ticker}: "${text.slice(0, 80)}"`);
-  }
-  if (text.toLowerCase().includes('no data')) {
-    throw new Error(`Stooq has no data for ${ticker}`);
-  }
-  return parseStooqCSV(text);
+
+  return values;
 }
 
 // ============ 主处理函数 ============
@@ -160,20 +174,19 @@ export default async function handler(req, res) {
   }
 
   try {
-    const values = await fetchFromStooq(ticker);
-    values.sort((a, b) => a.date.localeCompare(b.date));
-    const tail = values.slice(-250);
-    const closes = tail.map(v => v.close);
-    const highs = tail.map(v => v.high);
+    const values = await fetchFromYahoo(ticker);
+    const closes = values.map(v => v.close);
+    const highs = values.map(v => v.high);
     const currentPrice = closes[closes.length - 1];
 
+    // VIX: 只取当前值
     if (ticker === 'VIX') {
       const result = {
         ticker,
         price: round(currentPrice, 2),
-        dataPoints: tail.length,
-        latestDate: tail[tail.length - 1].date,
-        source: 'stooq',
+        dataPoints: values.length,
+        latestDate: values[values.length - 1].date,
+        source: 'yahoo',
         updatedAt: new Date().toISOString(),
         cached: false,
       };
@@ -181,12 +194,13 @@ export default async function handler(req, res) {
       return res.status(200).json(result);
     }
 
+    // QQQ / 其他股票: 算完整指标
     const ma200 = closes.length >= 200
       ? closes.slice(-200).reduce((a, b) => a + b, 0) / 200
       : null;
     const lookback = Math.min(252, highs.length);
     const ath52w = Math.max(...highs.slice(-lookback));
-    const weeklyCloses = aggregateToWeekly(tail);
+    const weeklyCloses = aggregateToWeekly(values);
     const rsiWeekly = calcWildersRSI(weeklyCloses, 14);
 
     const result = {
@@ -197,10 +211,10 @@ export default async function handler(req, res) {
       rsiWeekly: rsiWeekly !== null ? round(rsiWeekly, 1) : null,
       ma200Pct: ma200 ? round(((currentPrice - ma200) / ma200) * 100, 2) : null,
       drawdown: round(((ath52w - currentPrice) / ath52w) * 100, 2),
-      dataPoints: tail.length,
+      dataPoints: values.length,
       weeklyDataPoints: weeklyCloses.length,
-      latestDate: tail[tail.length - 1].date,
-      source: 'stooq',
+      latestDate: values[values.length - 1].date,
+      source: 'yahoo',
       updatedAt: new Date().toISOString(),
       cached: false,
     };
