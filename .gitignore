@@ -1,0 +1,19 @@
+# Environment variables (never commit API keys!)
+.env
+.env.local
+.env.*.local
+
+# Dependencies
+node_modules/
+
+# Vercel
+.vercel
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp

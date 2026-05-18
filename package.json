@@ -1,0 +1,7 @@
+{
+  "name": "qqq-smart-dca",
+  "version": "1.0.0",
+  "description": "QQQ smart DCA strategy dashboard with live market data",
+  "private": true,
+  "type": "module"
+}
