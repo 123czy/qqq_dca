@@ -1,16 +1,17 @@
 /**
  * Vercel Serverless Function: /api/market
  *
- * 拉取 QQQ 或 VIX 的当前价和历史数据，计算：
+ * 数据源 (全部免费、不要 key、不限流):
+ *   - 股票/ETF (QQQ): Stooq.com CSV
+ *   - VIX: Stooq.com (^VIX)
+ *
+ * 计算:
  *   - 当前价
  *   - 200 日均线 (SMA)
  *   - 52 周最高 (ATH)
  *   - 周线 RSI(14) - Wilder's smoothing
- *   - 距 MA200 百分比
- *   - 从 52 周高的回撤
  *
- * 数据源: Twelve Data API
- * 缓存: 内存 10 分钟（同一 ticker 复用）
+ * 缓存: 内存 10 分钟
  *
  * 调用示例:
  *   GET /api/market?ticker=QQQ
@@ -18,9 +19,8 @@
  */
 
 // ============ 内存缓存 ============
-// Vercel 函数实例会保持一段时间，缓存能跨请求复用
 const cache = new Map();
-const CACHE_TTL_MS = 10 * 60 * 1000; // 10 分钟
+const CACHE_TTL_MS = 10 * 60 * 1000;
 
 function getCached(key) {
   const item = cache.get(key);
@@ -38,17 +38,10 @@ function setCached(key, data) {
 
 // ============ 指标计算 ============
 
-/**
- * Wilder's RSI (14 期)
- * 接受按时间升序排列的收盘价数组，返回最后一个 RSI 值
- */
 function calcWildersRSI(closes, period = 14) {
   if (closes.length < period + 1) return null;
-
   let gains = 0;
   let losses = 0;
-
-  // 第一段平均
   for (let i = 1; i <= period; i++) {
     const change = closes[i] - closes[i - 1];
     if (change > 0) gains += change;
@@ -56,8 +49,6 @@ function calcWildersRSI(closes, period = 14) {
   }
   let avgGain = gains / period;
   let avgLoss = losses / period;
-
-  // Wilder's smoothing: 后续用指数平滑
   for (let i = period + 1; i < closes.length; i++) {
     const change = closes[i] - closes[i - 1];
     const gain = change > 0 ? change : 0;
@@ -65,31 +56,9 @@ function calcWildersRSI(closes, period = 14) {
     avgGain = (avgGain * (period - 1) + gain) / period;
     avgLoss = (avgLoss * (period - 1) + loss) / period;
   }
-
   if (avgLoss === 0) return 100;
   const rs = avgGain / avgLoss;
   return 100 - 100 / (1 + rs);
-}
-
-/**
- * 把日线数据聚合成周线（按 ISO 周分组，取每周最后一天的收盘）
- * dailyData: [{date: 'YYYY-MM-DD', close: number}, ...] 时间升序
- * 返回: [number, number, ...] 周线收盘价数组
- */
-function aggregateToWeekly(dailyData) {
-  if (dailyData.length === 0) return [];
-
-  const weeks = new Map();
-  for (const bar of dailyData) {
-    const d = new Date(bar.date + 'T00:00:00Z');
-    // 用 ISO 年-周作为 key
-    const year = d.getUTCFullYear();
-    const week = getISOWeek(d);
-    const key = `${year}-W${week}`;
-    // 同一周的最后一根 bar 会覆盖前面的
-    weeks.set(key, bar.close);
-  }
-  return Array.from(weeks.values());
 }
 
 function getISOWeek(date) {
@@ -101,42 +70,78 @@ function getISOWeek(date) {
   return 1 + Math.floor(diff / 7);
 }
 
-// ============ Twelve Data 调用 ============
+function aggregateToWeekly(dailyData) {
+  if (dailyData.length === 0) return [];
+  const weeks = new Map();
+  for (const bar of dailyData) {
+    const d = new Date(bar.date + 'T00:00:00Z');
+    const year = d.getUTCFullYear();
+    const week = getISOWeek(d);
+    weeks.set(`${year}-W${week}`, bar.close);
+  }
+  return Array.from(weeks.values());
+}
 
+// ============ Stooq 数据源 ============
 /**
- * 拉取 ticker 的 250 个交易日的日线数据
- * 返回 { meta, values: [{date, close}, ...] } 时间升序
+ * Stooq 返回 CSV:
+ *   Date,Open,High,Low,Close,Volume
+ *   2024-01-02,408.55,410.34,406.50,409.52,38500000
  */
-async function fetchTimeSeries(ticker, apiKey) {
-  // VIX 在 Twelve Data 里直接写 VIX 即可（自动识别为指数）
-  const symbol = ticker === 'VIX' ? 'VIX' : ticker;
-  const url = `https://api.twelvedata.com/time_series?symbol=${symbol}&interval=1day&outputsize=250&apikey=${apiKey}&order=asc`;
+function buildStooqUrl(ticker) {
+  if (ticker === 'VIX') return 'https://stooq.com/q/d/l/?s=%5Evix&i=d'; // %5E = ^
+  return `https://stooq.com/q/d/l/?s=${ticker.toLowerCase()}.us&i=d`;
+}
 
-  const res = await fetch(url);
+function parseStooqCSV(csvText) {
+  const lines = csvText.trim().split('\n');
+  if (lines.length < 2) {
+    throw new Error('Stooq CSV has no data rows');
+  }
+  const header = lines[0].toLowerCase();
+  if (!header.includes('date') || !header.includes('close')) {
+    throw new Error(`Stooq CSV header invalid: "${lines[0].slice(0, 100)}"`);
+  }
+  const values = [];
+  for (let i = 1; i < lines.length; i++) {
+    const parts = lines[i].split(',');
+    if (parts.length < 5) continue;
+    const close = parseFloat(parts[4]);
+    const high = parseFloat(parts[2]);
+    if (isNaN(close)) continue;
+    values.push({
+      date: parts[0],
+      high: isNaN(high) ? close : high,
+      close,
+    });
+  }
+  if (values.length === 0) {
+    throw new Error('Stooq CSV parsed but no valid rows');
+  }
+  return values;
+}
+
+async function fetchFromStooq(ticker) {
+  const url = buildStooqUrl(ticker);
+  const res = await fetch(url, {
+    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; QQQDCABot/1.0)' },
+  });
   if (!res.ok) {
-    throw new Error(`Twelve Data HTTP ${res.status}`);
+    throw new Error(`Stooq HTTP ${res.status} for ${ticker}`);
   }
-  const data = await res.json();
-  if (data.status === 'error') {
-    throw new Error(`Twelve Data error: ${data.message || 'unknown'}`);
+  const text = await res.text();
+  if (!text || text.length < 50) {
+    throw new Error(`Stooq returned empty for ${ticker}: "${text.slice(0, 80)}"`);
   }
-  if (!data.values || data.values.length === 0) {
-    throw new Error('Twelve Data returned no values');
+  if (text.toLowerCase().includes('no data')) {
+    throw new Error(`Stooq has no data for ${ticker}`);
   }
-
-  return {
-    values: data.values.map(v => ({
-      date: v.datetime,
-      close: parseFloat(v.close),
-      high: parseFloat(v.high),
-    })),
-  };
+  return parseStooqCSV(text);
 }
 
 // ============ 主处理函数 ============
 
 export default async function handler(req, res) {
-  // CORS - 允许从任何前端域名调用（包括本地开发）
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
 
@@ -145,37 +150,30 @@ export default async function handler(req, res) {
   }
 
   const ticker = (req.query.ticker || '').toUpperCase().trim();
-  if (!ticker || !/^[A-Z^]{1,8}$/.test(ticker)) {
-    return res.status(400).json({ error: 'Invalid ticker' });
+  if (!ticker || !/^[A-Z]{1,8}$/.test(ticker)) {
+    return res.status(400).json({ error: 'Invalid ticker', received: ticker });
   }
 
-  // 缓存命中？
   const cached = getCached(ticker);
   if (cached) {
     return res.status(200).json({ ...cached, cached: true });
   }
 
-  // 检查 API key
-  const apiKey = process.env.TWELVE_DATA_API_KEY;
-  if (!apiKey) {
-    return res.status(500).json({
-      error: 'API key not configured',
-      hint: 'Set TWELVE_DATA_API_KEY in environment variables',
-    });
-  }
-
   try {
-    const { values } = await fetchTimeSeries(ticker, apiKey);
-    const closes = values.map(v => v.close);
-    const highs = values.map(v => v.high);
-
+    const values = await fetchFromStooq(ticker);
+    values.sort((a, b) => a.date.localeCompare(b.date));
+    const tail = values.slice(-250);
+    const closes = tail.map(v => v.close);
+    const highs = tail.map(v => v.high);
     const currentPrice = closes[closes.length - 1];
 
-    // VIX 只取当前值，不算其他指标
     if (ticker === 'VIX') {
       const result = {
         ticker,
         price: round(currentPrice, 2),
+        dataPoints: tail.length,
+        latestDate: tail[tail.length - 1].date,
+        source: 'stooq',
         updatedAt: new Date().toISOString(),
         cached: false,
       };
@@ -183,17 +181,12 @@ export default async function handler(req, res) {
       return res.status(200).json(result);
     }
 
-    // QQQ / 其他股票: 算完整指标
     const ma200 = closes.length >= 200
       ? closes.slice(-200).reduce((a, b) => a + b, 0) / 200
       : null;
-
-    // 52 周高 = 过去约 252 个交易日的最高价
     const lookback = Math.min(252, highs.length);
     const ath52w = Math.max(...highs.slice(-lookback));
-
-    // 周线 RSI
-    const weeklyCloses = aggregateToWeekly(values);
+    const weeklyCloses = aggregateToWeekly(tail);
     const rsiWeekly = calcWildersRSI(weeklyCloses, 14);
 
     const result = {
@@ -201,20 +194,23 @@ export default async function handler(req, res) {
       price: round(currentPrice, 2),
       ma200: ma200 ? round(ma200, 2) : null,
       ath52w: round(ath52w, 2),
-      rsiWeekly: rsiWeekly ? round(rsiWeekly, 1) : null,
+      rsiWeekly: rsiWeekly !== null ? round(rsiWeekly, 1) : null,
       ma200Pct: ma200 ? round(((currentPrice - ma200) / ma200) * 100, 2) : null,
       drawdown: round(((ath52w - currentPrice) / ath52w) * 100, 2),
-      dataPoints: values.length,
+      dataPoints: tail.length,
+      weeklyDataPoints: weeklyCloses.length,
+      latestDate: tail[tail.length - 1].date,
+      source: 'stooq',
       updatedAt: new Date().toISOString(),
       cached: false,
     };
-
     setCached(ticker, result);
     return res.status(200).json(result);
   } catch (err) {
-    console.error('Market API error:', err);
+    console.error(`[market] ticker=${ticker}:`, err);
     return res.status(502).json({
       error: 'Failed to fetch market data',
+      ticker,
       detail: err.message,
     });
   }
